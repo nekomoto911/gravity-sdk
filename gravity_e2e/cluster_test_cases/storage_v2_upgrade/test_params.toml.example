@@ -1,0 +1,74 @@
+# storage_v2_upgrade test parameters
+#
+# Copy to test_params.toml (untracked), edit, then render:
+#     cp test_params.toml.example test_params.toml
+#     python render_config.py
+#
+# ── [source]: the OLD (pre-upgrade) binary, i.e. v1.7.5 ──────────────────
+# Takes exactly the forms cluster/deploy.sh resolve_source accepts — pick
+# ONE of bin_path / project_path / github+rev. The canonical channel is
+# the v1.7.5 GitHub release asset (sha256-verified); see README.md for the
+# download commands and for the glibc >= 2.38 preflight + source-build
+# fallback on older hosts.
+[source]
+bin_path = "../target/quick-release/v1.7.5/gravity_node"
+
+[genesis_contracts]
+repo = "https://github.com/Galxe/gravity_chain_core_contracts.git"
+# "main" is what every current e2e suite (and CI against sdk main, the
+# v1.7.x line) initializes with, so it is the right pin for a chain BORN
+# on v1.7.5.
+ref = "main"
+
+# ── [hardforks]: the FORK TIMELINE is what makes or breaks this case ─────
+# Mainnet baseline (genesis/mainnet/genesis.json): NO gravity hardforks at
+# all — Alpha/Beta/Gamma/Delta unscheduled. greth v2.3.0 gates its behavior
+# changes (system-tx gas exemption, SYSTEM_CALLER balance migration) on
+# Alpha, so the OPERATIONAL RULE is: Alpha must NOT activate before every
+# node runs the new binary. An alphaTime placed before existing v1.7.5
+# history makes the new binary re-execute those blocks under exempt
+# semantics and diverge — the node aborts ~2 s after start with
+# "panicked at ...block_store.rs:773 / assertion `left == right` failed"
+# on two 32-byte block hashes (observed live 2026-07-15 with the legacy
+# alphaTime = 0; never copy that value from older suites into this case).
+#
+# The whole timeline is fixed at RENDER time (rolling_upgrade's mechanism:
+# compute the fork points once before the run, never touch config
+# mid-test) — re-render right before each run so the relative offsets stay
+# anchored to reality.
+#
+# betaBlock = 100: activates early, while the cluster still runs v1.7.5 —
+#   safe because Beta carries no attached semantics in either binary
+#   (schedule-only fork); it exercises a fork already active pre-upgrade.
+# gammaBlock: rolling_upgrade's timeline rule — must activate only after
+#   all 6 nodes finished upgrading. At the observed 2.6-3.7 blocks/s the
+#   upgrades complete by block ~3900-5500 even when phase 3 stretches to
+#   ~25 min; 6000 stays above that while being crossed at ~27-38 min, i.e.
+#   comfortably before the Alpha schedule below.
+[hardforks]
+betaBlock = 100
+gammaBlock = 6000
+
+# alphaTime = render_time + upgrade_budget + stability_window + margin.
+# Each component is a "+NN[smh]" offset, individually tunable:
+#   upgrade_budget:   worst-case render -> fleet fully upgraded (runner
+#                     init/genesis/deploy ~3-5 min, bootstrap + history
+#                     ~2 min, 6 upgrades with 5x120 s inter-node waits
+#                     ~16-20 min). The case FAILS (phase 3 completion
+#                     guard) if the fleet is not done before alphaTime.
+#   stability_window: post-upgrade stable operation before activation —
+#                     gamma tail, 60 s stabilize + 300 s health monitor
+#                     under sustained load, tx floors, H2 offline probe.
+#   margin:           schedule slack. If phases 4-7 outrun it, activation
+#                     is simply crossed a little before the dedicated
+#                     phase observes it (verified retroactively — logged,
+#                     not a failure); if they run fast, phase 8 idles
+#                     until activation.
+# Drop this whole table for the pure mainnet posture (Alpha never
+# activates; phases 8's crossing and the post-alpha reassertions skip).
+# The phase-1 guard rejects schedules closer than 25 min (upgrade safety)
+# or beyond 2 h (scheduled = mandatory coverage, must be reachable).
+[hardforks.alphaTime]
+upgrade_budget = "+27m"
+stability_window = "+13m"
+margin = "+10m"
