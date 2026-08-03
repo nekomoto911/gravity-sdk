@@ -1,18 +1,19 @@
 """
-Pure helpers for the storage_v2_fresh_sync case (TC9).
+Pure helpers for the storage_v2_fresh_sync case (TC9 + prune guardrail).
 
 Deterministic and unit-tested in
 gravity_e2e/tests/unit/test_storage_fresh_sync_case.py (loaded by file
 path; this directory is not a package). The pytest case keeps
 orchestration and assertions; this module keeps the derivable facts:
 
-- the topology constants (which nodes are legacy / SF, and each
-  fullnode's pinned upstream — the SF x non-SF coverage matrix);
-- resolve_sf_mode: the [sf] mode knob with its env override
-  (GRAVITY_SF_MODE), and which modes the case can actually execute today;
-- sf_start_extra_args: the form-B argument set, reserved until greth
-  wires --storage.v2 into init_genesis AND Node.start() can inject
-  per-node args (design doc sf-fresh-sync-design.md §2/Q1).
+- topology constants (legacy / SF node sets, pinned upstreams for the
+  SF x non-SF matrix, plus sf_prune1 as the SF prune-profile pfn);
+- resolve_sf_mode: [sf] mode knob + GRAVITY_SF_MODE override
+  ("flag" = form B primary via --storage.v2; "migrate" = form D);
+- inject_sf_v2_flag_reth_args / inject_prune_reth_args: pure rewrites of
+  a node's reth_config.json dict (the case owns the file I/O);
+- sf_start_extra_args: CLI encoding of the form-B flag (clap contract
+  lock for unit tests; production injects via reth_config, not Node.start).
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ SF_NODE_IDS: Tuple[str, ...] = (
     "sf_vfn2",
     "sf_pfn1",
     "sf_pfn2",
+    "sf_prune1",  # SF pfn that ALSO runs reth's full-node prune profile
 )
 
 # Every fullnode's pinned upstream (static seeds + discovery none in
@@ -42,6 +44,7 @@ PINNED_UPSTREAMS: Mapping[str, str] = {
     "sf_vfn2": "sf_val1", # SF vfn      <- SF validator
     "sf_pfn1": "sf_vfn1", # SF pfn      <- SF vfn
     "sf_pfn2": "vfn1",    # SF pfn      <- legacy vfn
+    "sf_prune1": "sf_vfn1", # SF prune pfn <- SF vfn (sf_pfn1 is its archive twin)
 }
 
 # SF fullnodes whose upstream exists from phase 1 (first batch); sf_pfn1
@@ -165,8 +168,11 @@ def first_stop_ready(uptime_s: float, height: int) -> bool:
 #   across restarts is harmless.
 # - "migrate" (form D, compatibility): fresh init -> stable-runtime wait
 #   -> stop -> db migrate-changesets (#391 fix) -> restart.
+# Both forms are executable. Code default when [sf].mode is omitted is
+# "migrate" (works on any binary with the #391 preflight fix). The
+# recommended / example pin is "flag" (requires feat/sf-fresh-init).
 SF_MODES: Tuple[str, ...] = ("migrate", "flag")
-EXECUTABLE_SF_MODES: Tuple[str, ...] = ("migrate", "flag")
+DEFAULT_SF_MODE = "migrate"
 
 # The reth_args entry the flag mode injects into an SF node's
 # config/reth_config.json: an EMPTY value makes the generated
@@ -180,22 +186,25 @@ SF_FLAG_RETH_ARG = "storage.v2"
 
 def resolve_sf_mode(params: Mapping, environ: Mapping[str, str]) -> str:
     """The effective SF-enable mode: GRAVITY_SF_MODE overrides the params
-    [sf].mode; default "migrate". Raises on unknown modes."""
+    [sf].mode; default DEFAULT_SF_MODE ("migrate"). Raises on unknown modes."""
     mode = environ.get("GRAVITY_SF_MODE") or params.get("sf", {}).get(
-        "mode", "migrate"
+        "mode", DEFAULT_SF_MODE
     )
     if mode not in SF_MODES:
         raise ValueError(f"[sf] mode must be one of {SF_MODES}, got {mode!r}")
-    if mode not in EXECUTABLE_SF_MODES:
-        raise NotImplementedError(f"[sf] mode {mode!r} is not executable")
     return mode
 
 
 def sf_start_extra_args(mode: str) -> Sequence[str]:
-    """Extra gravity_node args for an SF node's FIRST start under the
-    given mode. Form D needs none (the flip happens offline via
-    migrate-changesets); form B passes the bare opt-in flag (== true per
-    the clap definition anchored at SF_FLAG_RETH_ARG)."""
+    """CLI encoding of the form-B ``--storage.v2`` flag for the given mode.
+
+    Production form B injects the flag into each SF node's
+    ``config/reth_config.json`` (see :func:`inject_sf_v2_flag_reth_args`)
+    rather than via ``Node.start`` extra args — deploy.sh's start script
+    materializes bare reth_args the same way. This helper remains as the
+    pure clap-surface encoding used by unit tests to lock
+    ``bare flag == true``. Form D needs no extra args (offline migrate).
+    """
     if mode == "migrate":
         return ()
     if mode == "flag":
@@ -211,6 +220,68 @@ def inject_sf_v2_flag_reth_args(reth_config: Mapping) -> dict:
     config = dict(reth_config)
     reth_args = dict(config.get("reth_args") or {})
     reth_args[SF_FLAG_RETH_ARG] = ""
+    config["reth_args"] = reth_args
+    return config
+
+
+# ── Prune-node knobs (storage-v2 + --full config-path smoke test) ──
+#
+# sf_prune1 is an SF fullnode (new layout, from block 0) that ALSO runs the
+# production prune shape: `--full --prune.transactionlookup.distance 10064`.
+# It is a CONFIG-PATH smoke test, not a "watch pruning happen" test.
+#
+# Why we can't scale the distance down (runtime fact, found live 2026-07-23):
+# reth caps the AccountHistory/StorageHistory segments at a hard floor
+# MINIMUM_UNWIND_SAFE_DISTANCE = 32*2 + 10_000 = 10064 (greth
+# crates/prune/types/src/target.rs:12). prune_target_block_with_min
+# (mode.rs:57-68) accepts Distance(d) only when d > tip (nothing-to-prune) OR
+# d >= min_blocks; a sub-min explicit distance like 128 hits neither branch
+# and falls to `_ => Err(PruneSegmentError::Configuration(segment))`, which
+# CRASHES the persistence service ("Persistence service failed
+# err=PrunerError(PruneSegment(Configuration(AccountHistory)))" +
+# "persistence channel closed", ~16 s after start). So an explicit
+# accounthistory/storagehistory distance below 10064 is not "scaled down",
+# it is a hard misconfiguration. This harness's chain only reaches ~1800
+# blocks, well under 10064, so:
+#   - <10064 explicit  -> Configuration crash;
+#   - >=10064 explicit -> Distance(d) > tip -> None -> never triggers here;
+# i.e. NO distance in this harness can OBSERVE changeset pruning. We
+# therefore assert the config PATH is safe (no crash, no corruption) and that
+# changeset pruning correctly stays in NOT_YET_EXPECTED (tip < floor).
+#
+# `--full` itself is safe: for AccountHistory/StorageHistory it behaves like
+# Distance(min_blocks=10064) and returns None while tip < 10064 (mode.rs:61),
+# so it never crashes. Under --full, receipts (min_blocks 64) DO prune
+# (tip-64) and senderrecovery/txlookup (min_blocks 0) prune to tip; the
+# explicit txlookup distance 10064 is > tip so tx-lookup stays unpruned here.
+PRUNE_NODE_ID = "sf_prune1"
+
+# The AccountHistory/StorageHistory hard floor (greth target.rs:12). Any
+# explicit distance below this for those segments crashes the pruner; used
+# here as the distance the changeset classifier reasons against (tip < floor
+# => NOT_YET_EXPECTED).
+MINIMUM_UNWIND_SAFE_DISTANCE = 32 * 2 + 10_000  # 10064
+
+# reth_args = the user's production prune shape. `full` uses an empty value so
+# deploy.sh's start-script emits the bare `--full` (same bare-flag encoding as
+# SF_FLAG_RETH_ARG); the distance key renders as
+# `--prune.transactionlookup.distance 10064`. Deliberately NO explicit
+# accounthistory/storagehistory distance — those crash below 10064 (see above)
+# and --full handles them safely.
+PRUNE_RETH_ARGS: Mapping[str, object] = {
+    "full": "",
+    "prune.transactionlookup.distance": MINIMUM_UNWIND_SAFE_DISTANCE,
+}
+
+
+def inject_prune_reth_args(reth_config: Mapping) -> dict:
+    """A copy of a node's reth_config.json dict with the full-node prune
+    profile merged into .reth_args (see PRUNE_RETH_ARGS). Coexists with the
+    --storage.v2 opt-in (both are plain reth_args entries); pure — the case
+    owns the file I/O. Other entries preserved."""
+    config = dict(reth_config)
+    reth_args = dict(config.get("reth_args") or {})
+    reth_args.update(PRUNE_RETH_ARGS)
     config["reth_args"] = reth_args
     return config
 

@@ -10,25 +10,26 @@
 [source]
 bin_path = "../target/quick-release/v1.7.5/gravity_node"
 
-# ── [sf_source]: the NEW binary for the five SF nodes ────────────────────
+# ── [sf_source]: the NEW binary for the six SF nodes ─────────────────────
 # The same merge v2.3.0 binary the legacy core is upgraded TO (the case
-# asserts both facts at phase 1). For [sf] mode = "flag" it must carry
-# greth's feat/sf-fresh-init wiring (--storage.v2 -> genesis init); for
-# mode = "migrate" it must carry the #391 preflight fix.
+# asserts both facts at phase 1). Includes sf_prune1. For [sf]
+# mode = "flag" it must carry greth's feat/sf-fresh-init wiring
+# (--storage.v2 -> genesis init); for mode = "migrate" it must carry
+# the #391 preflight fix.
 [sf_source]
 bin_path = "../target/quick-release/gravity_node"
 
 # ── [sf]: how fresh nodes get the SF layout ──────────────────────────────
-# "flag"    (form B, default): the SF nodes' deploy config carries the
-#           bare --storage.v2 (default false; bare flag == true), so
+# "flag"    (form B, recommended): the SF nodes' deploy config carries
+#           the bare --storage.v2 (default false; bare flag == true), so
 #           fresh init writes SF settings and the genesis alloc as
 #           entity rows in the changeset segments (greth
-#           feat/sf-fresh-init, b709e71df8 + 09097fbab3). No
-#           stop/migrate/restart machinery runs.
-# "migrate" (form D, compatibility): first start -> stable-runtime wait
-#           -> stop -> db migrate-changesets -> restart. Works with any
-#           binary carrying the #391 fix; kept as the migration-path
-#           twin of the same on-disk product.
+#           feat/sf-fresh-init). No stop/migrate/restart machinery runs.
+# "migrate" (form D, compatibility; code default if this key is omitted):
+#           first start -> stable-runtime wait -> stop ->
+#           db migrate-changesets -> restart. Works with any binary
+#           carrying the #391 fix; migration-path twin of the same
+#           on-disk product.
 [sf]
 mode = "flag"
 
@@ -59,7 +60,7 @@ gammaBlock = 1200
 # Sized from MEASURED attempt5 timings, not TC2's 6-node legacy tier
 # (+27m/+13m/+10m): the whole 4-node rolling upgrade took ~7 min live,
 # and every extra minute of schedule is a minute of extra chain age the
-# five SF nodes must replay from 0 at a net convergence of only
+# six SF nodes must replay from 0 at a net convergence of only
 # ~1.4-1.9 blk/s (tc9-catchup-freeze-investigation.md) — halving the
 # chain age roughly halves the from-0 catch-up cost.
 #   upgrade_budget +12m: runner init/deploy ~4-5 min + phase 1 (~1 min)

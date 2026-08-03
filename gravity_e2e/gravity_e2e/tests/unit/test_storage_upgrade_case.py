@@ -191,6 +191,54 @@ def test_segment_sampling_rejects_garbage():
 
 
 # ---------------------------------------------------------------------------
+# safe_anchor_head (propagation-safe pre-migration sampling ceiling)
+# ---------------------------------------------------------------------------
+
+
+def test_safe_anchor_head_backs_off_by_margin_on_a_long_chain():
+    # Normal run: head far past boundary, the full margin is absorbed.
+    assert upgrade_lib.safe_anchor_head(12_500, boundary=12_000, margin=100) == 12_400
+
+
+def test_safe_anchor_head_never_samples_past_the_tip():
+    # margin=0 degenerates to the tip itself; result never exceeds head.
+    assert upgrade_lib.safe_anchor_head(500, boundary=None, margin=0) == 500
+    assert upgrade_lib.safe_anchor_head(500, boundary=None, margin=10) == 490
+
+
+def test_safe_anchor_head_clamps_above_boundary_on_a_short_chain():
+    # head barely past boundary: the full margin would push the ceiling
+    # to/below boundary and empty era C — clamp keeps it strictly above,
+    # and the composed sample still yields a non-empty era C.
+    safe = upgrade_lib.safe_anchor_head(12_010, boundary=12_000, margin=100)
+    assert safe == 12_001 and safe > 12_000
+    blocks = upgrade_lib.sample_segment_blocks(
+        history_max=60, boundary=12_000, head=safe, per_segment=4
+    )
+    assert [b for b in blocks if b > 12_000], "era C must not be empty"
+    assert 12_000 in blocks
+
+
+def test_safe_anchor_head_mainnet_posture_floors_at_one():
+    # No boundary; the margin never drops the ceiling below block 1.
+    assert upgrade_lib.safe_anchor_head(30, boundary=None, margin=100) == 1
+
+
+def test_sample_never_exceeds_the_safe_head_ceiling():
+    # The FIX invariant: backing the ceiling off by >= the tolerated gap
+    # keeps every sampled block out of the near-tip band (safe_head, head]
+    # that a laggard node may not have imported yet.
+    head, margin = 12_500, 100
+    safe = upgrade_lib.safe_anchor_head(head, boundary=12_000, margin=margin)
+    assert safe == head - margin
+    blocks = upgrade_lib.sample_segment_blocks(
+        history_max=60, boundary=12_000, head=safe, per_segment=4
+    )
+    assert max(blocks) <= safe
+    assert all(not (safe < b <= head) for b in blocks)
+
+
+# ---------------------------------------------------------------------------
 # is_upgrade_target (the phase-1 same-binary guard predicate)
 # ---------------------------------------------------------------------------
 

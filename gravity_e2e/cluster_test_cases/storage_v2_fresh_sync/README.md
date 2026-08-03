@@ -1,11 +1,12 @@
-# storage_v2_fresh_sync (storage-v2 TC9)
+# storage_v2_fresh_sync (storage-v2 TC9 + prune guardrail)
 
 SF-enabled **fresh nodes sync from block 0** on a rolling-upgraded
-network, and an **SF validator votes** — with the SF × non-SF
-upstream/downstream matrix fully covered. Design doc:
+network, an **SF validator votes**, and an **SF pfn with reth's
+production `--full` prune profile** survives the config path — with the
+SF × non-SF upstream/downstream matrix fully covered. Design doc:
 `_local/drafts/storage-v2-e2e/sf-fresh-sync-design.md` (repo-external).
 
-## Topology (9 nodes)
+## Topology (10 nodes)
 
 | node | role | layout | upstream | purpose |
 |---|---|---|---|---|
@@ -15,8 +16,9 @@ upstream/downstream matrix fully covered. Design doc:
 | sf_val1 | validator | **SF** | — (joins) | G3: SF validator votes |
 | sf_vfn1 | vfn | **SF** | node2 | SF vfn ← legacy validator |
 | sf_vfn2 | vfn | **SF** | sf_val1 | SF vfn ← SF validator |
-| sf_pfn1 | pfn | **SF** | sf_vfn1 | SF pfn ← SF vfn |
+| sf_pfn1 | pfn | **SF** | sf_vfn1 | SF pfn ← SF vfn (archive twin of sf_prune1) |
 | sf_pfn2 | pfn | **SF** | vfn1 | SF pfn ← legacy vfn |
+| sf_prune1 | pfn | **SF + --full** | sf_vfn1 | config-path prune guardrail |
 
 ## Phases
 
@@ -37,17 +39,28 @@ upstream/downstream matrix fully covered. Design doc:
    **equal stake** (2 ETH = genesis stake → 3-validator quorum = ALL
    votes) → L1 active, L2 healthy epoch;
 8. sf_vfn2 (SF ← SF validator) closes the matrix;
-9. **L3 necessity probe**: stop sf_val1 → chain MUST freeze → restart →
-   chain resumes, still active (its offline SF probe rides the window);
-10. load floors, final A+B replay on all nodes, log scan.
+9. **prune guardrail** (`sf_prune1`): born-SF from-0 sync under
+   production `--full --prune.transactionlookup.distance 10064` → no
+   pruner/persistence crash → offline changeset classify
+   `NOT_YET_EXPECTED` (tip ≪ 10064 floor) → online reads match archive
+   twin `sf_pfn1` (no wrong values);
+10. **L3 necessity probe**: stop sf_val1 → chain MUST freeze → restart →
+    chain resumes, still active (its offline SF probe rides the window);
+11. load floors, final A+B replay on all non-prune nodes, log scan
+    (sf_prune1 is exempt from whole-history anchor replay — `--full`
+    drops old receipts/logs).
 
-## SF enable (until greth wires a fresh-init switch)
+## SF enable
 
-`[sf] mode = "migrate"` (form D): first start (fresh init) → stop →
-`db migrate-changesets` → restart. **Requires a binary with the #391
-preflight fix** (block-0 genesis reverts must be accepted and migrated
-as entity rows). `mode = "flag"` (form B, `--storage.v2`) is reserved
-until greth wires the flag into init_genesis.
+Both forms are executable; they yield the same on-disk product:
+
+| mode | form | how | when to use |
+|---|---|---|---|
+| `"flag"` | B (recommended) | phase 1 injects bare `--storage.v2` into each SF node's `reth_config.json`; fresh init is born on SF (genesis alloc as entity rows) | greth with feat/sf-fresh-init (`--storage.v2` → genesis init) |
+| `"migrate"` | D (compatibility) | first start → stable-runtime wait → stop → `db migrate-changesets` → restart | any binary with the #391 preflight fix; also the **code default** when `[sf].mode` is omitted |
+
+`test_params.toml.example` pins `mode = "flag"`. Override at run time
+with `GRAVITY_SF_MODE=migrate|flag`.
 
 ## Fund flow (three accounts — do not "just use the faucet")
 
@@ -101,6 +114,23 @@ re-pacing the chain is a one-line change plus unit-locked derivations.
 Catch-up waits stay progress-based (`helpers/catchup.py`), never fixed
 deadlines.
 
+### Prune guardrail scope
+
+`sf_prune1` asserts the **config path** is safe under the production
+shape (`--full` + txlookup distance at reth's
+`MINIMUM_UNWIND_SAFE_DISTANCE = 10064`). This harness's chain only
+reaches ~1800 blocks, well under that floor, so:
+
+- changeset pruning correctly stays `NOT_YET_EXPECTED` (lowest segment
+  block 0 is correct while tip < floor);
+- an explicit sub-floor `accounthistory`/`storagehistory` distance would
+  **crash** the persistence service (live 2026-07-23 finding) — the
+  phase scans reth logs for those markers;
+- the static-file reclamation leak (`NOT_RECLAIMED` once tip > 10064)
+  and below-horizon `StateAtBlockPruned` reads are covered by unit tests
+  + the single-node empirical run (design doc §11/§12.1), not this short
+  chain.
+
 ### Open question for greth (from the attempt5-7 investigations)
 
 **Why does fast sync net only ~1 block per sync round?** The fullnode
@@ -121,6 +151,6 @@ and the investigation archive keep them; every realism concession
 recorded then is withdrawn.
 
 The Alpha schedule stays compressed to keep the chain young at phase 4.
-Expected end-to-end: **~55-75 min** (at ~1 blk/s the phase-4 gap is only
+Expected end-to-end: **~55-80 min** (at ~1 blk/s the phase-4 gap is only
 ~1400 blocks ⇒ minutes of syncing; the rolling-upgrade front section,
-epoch waits and the L3 probe dominate).
+epoch waits, the prune guardrail and the L3 probe dominate).

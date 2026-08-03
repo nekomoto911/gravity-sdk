@@ -175,6 +175,27 @@ def sample_segment_blocks(
     return sorted(b for b in blocks if 1 <= b <= head)
 
 
+def safe_anchor_head(head: int, boundary: Optional[int], margin: int) -> int:
+    """Propagation-safe sampling ceiling for the pre-migration anchor round.
+
+    ``sample_segment_blocks`` includes its ``head`` endpoint, but that round
+    replays on EVERY node while a laggard (e.g. vfn1 under sustained load)
+    can sit up to the tolerated height gap behind the leader whose tip was
+    read — a near-tip block it has not imported yet fails replay with "block
+    not found". Backing the ceiling off by ``margin`` (>= that gap) excludes
+    the band the laggard may lack; the leading edge carries no
+    historical-changeset coverage, so nothing is lost.
+
+    ``margin`` is clamped so the ceiling never drops to/below ``boundary``
+    (which would empty era C, ``(boundary, head]``) nor past the true tip on
+    a chain too short to absorb the full margin, and never below block 1.
+    """
+    ceiling = max(head - margin, 1)
+    if boundary is not None:
+        ceiling = min(max(ceiling, boundary + 1), head)
+    return ceiling
+
+
 def is_upgrade_target(binary: Union[str, Path], new_binary: Union[str, Path]) -> bool:
     """True when the deployed ``binary`` is (a copy of) the upgrade target:
     same inode (hardlink) or an identical-size file.

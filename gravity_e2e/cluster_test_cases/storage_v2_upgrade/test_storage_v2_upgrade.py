@@ -182,6 +182,11 @@ NEW_BINARY_PATH = Path(
 # ── Orchestration parameters (rolling_upgrade lineage) ──
 # Maximum allowed block height gap between nodes.
 MAX_HEIGHT_GAP = 50
+# Consecutive single-sample gap violations tolerated before failing a live
+# monitoring loop (vfn_shadow idiom): a transient spike right after a
+# rolling step recovers within a check or two, only a sustained stall
+# fails. The gap threshold itself stays MAX_HEIGHT_GAP.
+MAX_HEIGHT_GAP_VIOLATIONS = 3
 # Wait between upgrading individual nodes. 120s (vs rolling_upgrade's
 # 180s) keeps the whole TC2+TC3 flow inside the ~1h budget; the height-gap
 # precheck before every node still gates on actual catch-up.
@@ -263,6 +268,14 @@ TAIL_SET_VALUE = 3
 # round (v1.7.5 / pre-alpha / post-alpha; see
 # upgrade_lib.sample_segment_blocks).
 ANCHOR_SAMPLES_PER_SEGMENT = 4
+# Back the pre-migration anchor sampling ceiling off node1's tip by this
+# many blocks. That round replays on EVERY node (phase 12 ->
+# replay_anchors_on_all_nodes) and a laggard vfn can sit up to
+# MAX_HEIGHT_GAP behind the leader under sustained load; a near-tip block
+# it has not imported yet fails the replay with "block not found". Kept at
+# 2x the tolerated gap for headroom against transient spikes — the leading
+# edge carries no historical-changeset coverage anyway.
+ANCHOR_HEAD_MARGIN = 2 * MAX_HEIGHT_GAP
 # migrate-changesets budget per node. The tables carry only tens of
 # thousands of entries here (~16k/29k live), so the real runs are
 # seconds; the ceiling is the helper's conservative default.
@@ -1239,17 +1252,25 @@ async def phase_12_pre_migration_anchors(ctx: UpgradeContext) -> None:
     LOG.info("[Phase 12] TC4: pre-migration anchor reinforcement...")
     node = ctx.cluster.get_node("node1")
     head = await asyncio.to_thread(lambda: node.w3.eth.block_number)
+    # Sample off a ceiling backed away from node1's tip: this historical
+    # round replays on every node, and a laggard vfn may not have imported
+    # the near-tip blocks yet (see ANCHOR_HEAD_MARGIN).
+    safe_head = upgrade_lib.safe_anchor_head(
+        head, ctx.alpha_boundary_block, ANCHOR_HEAD_MARGIN
+    )
     blocks = upgrade_lib.sample_segment_blocks(
         ctx.max_history_block,
         ctx.alpha_boundary_block,
-        head,
+        safe_head,
         per_segment=ANCHOR_SAMPLES_PER_SEGMENT,
     )
     LOG.info(
-        "[Phase 12] sampled blocks (history_max=%d, boundary=%s, head=%d): %s",
+        "[Phase 12] sampled blocks (history_max=%d, boundary=%s, head=%d, "
+        "safe_head=%d): %s",
         ctx.max_history_block,
         ctx.alpha_boundary_block,
         head,
+        safe_head,
         blocks,
     )
     faucet_address = ctx.cluster.faucet.address
@@ -1354,13 +1375,22 @@ async def phase_14_sf_full_verification(ctx: UpgradeContext) -> None:
     )
     window_start = time.monotonic()
     checks = 0
+    # A rolling migration can leave a brief height spike in its wake; only a
+    # gap that STAYS wide across consecutive checks is a real stall (vfn_shadow
+    # idiom — increment on a bad sample, reset on a good one).
+    gap_violations = 0
     while time.monotonic() - window_start < POST_MIGRATION_LOAD_S:
         await asyncio.sleep(10)
         checks += 1
         heights = await get_block_heights(list(ctx.cluster.nodes.values()))
         gap = max(heights.values()) - min(heights.values())
-        assert gap < MAX_HEIGHT_GAP, (
-            f"height gap {gap} >= {MAX_HEIGHT_GAP} during the SF load window"
+        if gap >= MAX_HEIGHT_GAP:
+            gap_violations += 1
+        else:
+            gap_violations = 0
+        assert gap_violations < MAX_HEIGHT_GAP_VIOLATIONS, (
+            f"height gap stayed >= {MAX_HEIGHT_GAP} for {gap_violations} "
+            f"consecutive checks during the SF load window: {heights}"
         )
     LOG.info("[Phase 14] SF load window done (%d checks, all healthy)", checks)
 

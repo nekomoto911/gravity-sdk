@@ -10,15 +10,15 @@ supplies
                          v1.7.5 binary; bin_path / project_path /
                          github+rev, exactly the forms cluster/deploy.sh
                          resolve_source accepts),
-- [sf_source]         -> {{SF_SOURCE}} on the five SF nodes (the NEW,
+- [sf_source]         -> {{SF_SOURCE}} on the six SF nodes (the NEW,
                          merge v2.3.0 binary — the same binary the legacy
-                         nodes are upgraded TO),
+                         nodes are upgraded TO; includes sf_prune1),
 - [sf] mode           -> how the case turns the SF layout on for fresh
-                         nodes ("flag" = form B, primary: --storage.v2
+                         nodes ("flag" = form B, recommended: --storage.v2
                          in the SF nodes' deploy config, fresh init born
-                         on SF; "migrate" = form D, compatibility:
-                         init -> stop -> db migrate-changesets ->
-                         restart),
+                         on SF; "migrate" = form D, compatibility default
+                         when omitted: init -> stop -> db
+                         migrate-changesets -> restart),
 - [hardforks]         -> {{HARDFORKS}},
 - [genesis_contracts] -> {{GENESIS_CONTRACTS_REPO}} / {{GENESIS_CONTRACTS_REF}},
 
@@ -103,10 +103,10 @@ def hardforks_to_toml(hardforks: dict, now=None) -> str:
 
 
 def validate_sf_mode(sf: dict) -> str:
-    """The [sf] mode knob; defaults to "migrate" (form D). Both forms are
-    executable: "flag" (form B) rides greth's feat/sf-fresh-init
-    --storage.v2 wiring, "migrate" (form D) stays as the
-    migration-path twin."""
+    """The [sf] mode knob. Both forms are executable: "flag" (form B,
+    recommended pin in test_params.toml.example) rides greth's
+    feat/sf-fresh-init --storage.v2 wiring; "migrate" (form D) is the
+    migration-path twin and the default when the key is omitted."""
     mode = sf.get("mode", "migrate")
     if mode not in SF_MODES:
         raise ValueError(

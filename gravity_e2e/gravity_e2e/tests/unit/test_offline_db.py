@@ -830,3 +830,73 @@ class TestSegmentBlockRange:
     def test_rejects_foreign_names(self):
         with pytest.raises(ValueError, match="not a changeset segment"):
             segment_block_range("static_file_headers_0_499999")
+
+
+class TestChangesetLowestBlock:
+    """lowest_account_block / lowest_storage_block / highest_block: the
+    front-of-segment probes a prune node's layout assertion reads to tell a
+    working physical reclamation (lowest > 0) from the static-file
+    reclamation leak (lowest == 0 while tip > distance; design doc §12.1).
+    """
+
+    def test_none_when_no_segments(self, tmp_path):
+        datadir = tmp_path / "datadir"
+        build_static_files(datadir / "static_files", [])
+        layout = inspect_changeset_static_files(datadir)
+        assert layout.lowest_account_block is None
+        assert layout.lowest_storage_block is None
+        assert layout.highest_block is None
+
+    def test_zero_when_segments_reach_genesis(self, tmp_path):
+        # An archive node keeps block 0; on a prune node past the floor the
+        # same lowest==0 is the reclamation-leak signature (§12.1).
+        datadir = tmp_path / "datadir"
+        build_static_files(datadir / "static_files", [ACC_SEG, STO_SEG])
+        layout = inspect_changeset_static_files(datadir)
+        assert layout.lowest_account_block == 0
+        assert layout.lowest_storage_block == 0
+        assert layout.highest_block == 499999
+
+    def test_positive_when_front_truncated(self, tmp_path):
+        # A working prune truncates from the front: the oldest surviving
+        # segment starts above genesis.
+        datadir = tmp_path / "datadir"
+        build_static_files(
+            datadir / "static_files",
+            [
+                "static_file_account-change-sets_500000_999999",
+                "static_file_storage-change-sets_500000_999999",
+            ],
+        )
+        layout = inspect_changeset_static_files(datadir)
+        assert layout.lowest_account_block == 500000
+        assert layout.lowest_storage_block == 500000
+        assert layout.highest_block == 999999
+
+    def test_lowest_and_highest_span_multiple_ranges(self, tmp_path):
+        datadir = tmp_path / "datadir"
+        build_static_files(
+            datadir / "static_files",
+            [
+                "static_file_account-change-sets_500000_999999",
+                "static_file_account-change-sets_1000000_1499999",
+            ],
+        )
+        layout = inspect_changeset_static_files(datadir)
+        # min start across the (numeric-sorted) segments, max end.
+        assert layout.lowest_account_block == 500000
+        assert layout.highest_block == 1499999
+
+    def test_lowest_is_per_kind(self, tmp_path):
+        # Account and storage can be truncated to different boundaries.
+        datadir = tmp_path / "datadir"
+        build_static_files(
+            datadir / "static_files",
+            [
+                "static_file_account-change-sets_500000_999999",
+                "static_file_storage-change-sets_0_499999",
+            ],
+        )
+        layout = inspect_changeset_static_files(datadir)
+        assert layout.lowest_account_block == 500000
+        assert layout.lowest_storage_block == 0

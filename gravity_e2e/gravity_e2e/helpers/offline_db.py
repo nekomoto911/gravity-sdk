@@ -673,6 +673,50 @@ class ChangesetStaticFiles:
         """Any ``.csoff`` sidecar present (TC4 asserts present)."""
         return bool(self.account_sidecars or self.storage_sidecars)
 
+    @property
+    def lowest_account_block(self) -> Optional[int]:
+        """Start block of the oldest account-change-sets segment, or None
+        when there are none.
+
+        Distance-based account-history pruning removes the OLDEST blocks, so
+        a WORKING physical reclamation truncates the changeset segments from
+        the FRONT: a value > 0 is the direct on-disk proof that the segments
+        were shortened. A value stuck at 0 while the tip is far past the
+        prune distance is the static-file RECLAMATION LEAK signature — per
+        the 2026-07-23 empirical run (design doc §12.1) the logical prune has
+        advanced (read boundary at ``tip - distance``) but the static-file
+        bytes are never reclaimed (missing ``prune_static_files``, doc §11).
+        Disk alone cannot see the prune checkpoint, so it cannot tell this
+        leak apart from a hypothetical true no-op — the online
+        ``StateAtBlockPruned`` probe does. The lists are numeric-(start, end)
+        sorted, so ``account_segments[0]`` is genuinely the lowest-block
+        segment. See ``storage_case_lib.classify_changeset_prune``.
+        """
+        if not self.account_segments:
+            return None
+        return segment_block_range(self.account_segments[0])[0]
+
+    @property
+    def lowest_storage_block(self) -> Optional[int]:
+        """Start block of the oldest storage-change-sets segment, or None
+        when there are none. See :attr:`lowest_account_block`."""
+        if not self.storage_segments:
+            return None
+        return segment_block_range(self.storage_segments[0])[0]
+
+    @property
+    def highest_block(self) -> Optional[int]:
+        """End block of the newest segment across both changeset kinds, or
+        None when there are none — the segments' coverage upper bound (used
+        together with :attr:`lowest_account_block` to assert the retained
+        window is ``[tip - distance, tip]`` and not over-pruned)."""
+        ends = [
+            segment_block_range(segments[-1])[1]
+            for segments in (self.account_segments, self.storage_segments)
+            if segments
+        ]
+        return max(ends) if ends else None
+
 
 def segment_block_range(path: Union[str, Path]) -> Tuple[int, int]:
     """The numeric (start, end) block range encoded in a changeset segment

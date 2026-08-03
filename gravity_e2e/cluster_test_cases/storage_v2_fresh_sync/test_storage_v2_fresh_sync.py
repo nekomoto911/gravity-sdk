@@ -1,21 +1,23 @@
 """
 storage_v2_fresh_sync — SF-enabled fresh nodes sync from block 0 on a
-rolling-upgraded network, and an SF validator votes (storage-v2 TC9).
+rolling-upgraded network, an SF validator votes, and an SF prune-profile
+pfn survives the production --full shape (storage-v2 TC9 + prune guardrail).
 
 Scenario (design doc: _local/drafts/storage-v2-e2e/sf-fresh-sync-design.md):
 the legacy core (node1, node2, vfn1, pfn1) is BORN on v1.7.5, builds
 history, and is rolling-upgraded to merge v2.3.0 while staying on the
-legacy layout (settings MISSING — TC2's criterion). Five SF nodes then
+legacy layout (settings MISSING — TC2's criterion). Six SF nodes then
 come up fresh on the new binary and sync the whole chain from 0 —
 v1.7.5-era blocks, the upgrade window, the Alpha boundary — under the
 static-file changeset layout, covering the SF x non-SF upstream matrix:
 
-    vfn1    <- node1   (legacy vfn <- legacy validator, control)
-    pfn1    <- vfn1    (legacy pfn <- legacy vfn, control + tx entry)
-    sf_vfn1 <- node2   (SF vfn <- legacy validator)
-    sf_vfn2 <- sf_val1 (SF vfn <- SF validator)
-    sf_pfn1 <- sf_vfn1 (SF pfn <- SF vfn)
-    sf_pfn2 <- vfn1    (SF pfn <- legacy vfn)
+    vfn1      <- node1   (legacy vfn <- legacy validator, control)
+    pfn1      <- vfn1    (legacy pfn <- legacy vfn, control + tx entry)
+    sf_vfn1   <- node2   (SF vfn <- legacy validator)
+    sf_vfn2   <- sf_val1 (SF vfn <- SF validator)
+    sf_pfn1   <- sf_vfn1 (SF pfn <- SF vfn, archive twin of sf_prune1)
+    sf_pfn2   <- vfn1    (SF pfn <- legacy vfn)
+    sf_prune1 <- sf_vfn1 (SF pfn + reth --full prune profile)
 
 sf_val1 joins the validator set via governance-enabled permissionless
 join with a stake EQUAL to the genesis validators' (2 ETH): with three
@@ -26,18 +28,19 @@ restarting it must resume it.
 
 SF enablement (design §2, Q1), mode-switched via [sf] mode /
 GRAVITY_SF_MODE:
-- form B "flag" (primary): greth's feat/sf-fresh-init wires
+- form B "flag" (primary / example pin): greth's feat/sf-fresh-init wires
   --storage.v2 into genesis init (default false; bare flag == true) —
   the SF nodes carry it in their deploy config (phase 1) and are BORN
   on the SF layout, genesis alloc as entity rows (Q6 fixed, isomorphic
   with a migrate product). No stop/migrate/restart machinery runs.
-- form D "migrate" (compatibility): first start (fresh init_genesis,
-  legacy settings + block-0 genesis reverts) -> stable-runtime wait ->
-  stop -> `db migrate-changesets` (the #391 preflight fix) -> restart.
+- form D "migrate" (compatibility; code default when [sf].mode omitted):
+  first start (fresh init_genesis, legacy settings + block-0 genesis
+  reverts) -> stable-runtime wait -> stop -> `db migrate-changesets`
+  (the #391 preflight fix) -> restart.
 Both forms yield the same on-disk shape and share every assertion.
 
 Known constraints (design §3):
-(1) the runner starts ALL nodes before pytest, so phase 1 stops the five
+(1) the runner starts ALL nodes before pytest, so phase 1 stops the six
     SF nodes and wipes their data dirs to restore fresh-init semantics
     (identity/config/binary survive outside data/);
 (2) 2 genesis validators = f=0 until the join: every validator's
@@ -483,7 +486,7 @@ def scan_all_node_logs(cluster: Cluster, stage: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SF-enable hook (form D today, form B reserved) + fresh-state restore
+# SF-enable hook (form B flag inject / form D migrate) + fresh-state restore
 # ---------------------------------------------------------------------------
 
 
@@ -581,6 +584,23 @@ def inject_sf_v2_flag(node: Node) -> None:
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     LOG.info("[%s] injected --%s into %s", node.id,
              sf_lib.SF_FLAG_RETH_ARG, config_path)
+
+
+def inject_prune_config(node: Node) -> None:
+    """Give the prune node reth's full-node prune profile via its deploy
+    config: sf_lib.inject_prune_reth_args merges the production prune
+    shape (`--full` + prune.transactionlookup.distance=10064) into
+    .reth_args, alongside the --storage.v2 opt-in. Per-node and
+    restart-stable; prune node only."""
+    assert node.id == sf_lib.PRUNE_NODE_ID, (
+        f"{node.id}: the prune profile is for {sf_lib.PRUNE_NODE_ID} only"
+    )
+    config_path = node._infra_path / "config" / "reth_config.json"
+    assert config_path.is_file(), f"{node.id}: missing {config_path}"
+    config = sf_lib.inject_prune_reth_args(json.loads(config_path.read_text()))
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    LOG.info("[%s] injected full-node prune profile (--full + txlookup.distance=%d) into %s",
+             node.id, sf_lib.MINIMUM_UNWIND_SAFE_DISTANCE, config_path)
 
 
 async def start_fresh_sf_node(ctx, node_id: str) -> None:
@@ -820,6 +840,11 @@ async def phase_1_bootstrap_legacy_core(ctx: FreshSyncContext) -> None:
             # config now, so the case-controlled FIRST start fresh-inits
             # straight into the SF layout (legacy nodes never get it).
             inject_sf_v2_flag(node)
+        if node_id == sf_lib.PRUNE_NODE_ID:
+            # Prune guardrail: this SF node also runs reth's full-node prune
+            # profile from its first start (independent of the SF-enable
+            # mode — prune keys are plain start config).
+            inject_prune_config(node)
 
     for node_id in sf_lib.LEGACY_NODE_IDS:
         node = ctx.cluster.get_node(node_id)
@@ -1143,6 +1168,199 @@ async def phase_8_sf_vfn2_matrix_close(ctx: FreshSyncContext) -> None:
     await replay_all_batches(ctx, ctx.cluster.get_node("sf_vfn2"), "sf-from-sf")
 
 
+# reth log markers for the sub-min-distance persistence crash this phase
+# regression-guards against (mode.rs `_ => PruneSegmentError::Configuration`
+# -> the pruner kills the persistence service). Any of these means a prune
+# misconfiguration took the node down.
+PRUNER_CRASH_MARKERS = (
+    "Persistence service failed",
+    "persistence channel closed",
+    "PrunerError",
+    "PruneSegment(Configuration",
+)
+
+
+def assert_no_pruner_crash(node: Node, stage: str) -> None:
+    """Scan a node's reth logs for the prune-misconfiguration persistence
+    crash. This is the direct regression tripwire for the live 2026-07-23
+    finding: an explicit account/storage-history distance below
+    MINIMUM_UNWIND_SAFE_DISTANCE (10064) crashes the persistence service
+    ~16 s after start. A clean run has none of these lines."""
+    files = node_log_files(node)
+    assert files, f"[{stage}] {node.id}: no log files found for the pruner scan"
+    for log_file in files:
+        with open(log_file, errors="replace") as fh:
+            for lineno, line in enumerate(fh, 1):
+                for marker in PRUNER_CRASH_MARKERS:
+                    assert marker not in line, (
+                        f"[{stage}] {node.id}: pruner/persistence crash marker "
+                        f"{marker!r} in {log_file}:{lineno} — a prune "
+                        f"misconfiguration (sub-min distance?) took the node "
+                        f"down.\n  {line.strip()}"
+                    )
+    LOG.info("[%s] %s: no pruner/persistence crash markers in logs", stage, node.id)
+
+
+async def phase_prune_node_guardrail(ctx: FreshSyncContext) -> None:
+    """CONFIG-PATH smoke test: an SF fullnode running the production prune
+    shape (`--full --prune.transactionlookup.distance 10064`) must come up,
+    sync from 0, and keep the storage-v2 read path CORRECT — without
+    crashing the pruner and without corrupting or wrong-valuing reads.
+
+    This is a config-path test, NOT a "watch changeset pruning happen" test:
+    reth floors AccountHistory/StorageHistory at MINIMUM_UNWIND_SAFE_DISTANCE
+    (10064, greth target.rs:12), and this harness's chain only reaches ~1800
+    blocks — so changeset pruning legitimately never triggers here (tip <
+    floor -> NOT_YET_EXPECTED), and an explicit sub-floor distance would
+    instead CRASH the persistence service (mode.rs `_ => Configuration`; the
+    live 2026-07-23 finding). See design doc §3.3 / §9's runtime correction.
+
+    The changeset reclamation LEAK and the read-boundary reversal (below
+    tip-distance -> StateAtBlockPruned) only appear once tip > the 10064
+    floor; this short chain never gets there, so they are proven separately
+    — offline classifier unit tests + the single-node empirical run (design
+    doc §12.1) — not here. Here the effect must stay NOT_YET_EXPECTED.
+
+    Steps: born-SF from-0 sync -> reth-log tripwire (NO pruner/persistence
+    crash) -> offline changeset classify (must be NOT_YET_EXPECTED; never
+    NOT_RECLAIMED or OVER_PRUNED at this tip) -> online reads vs the archive
+    SF sibling sf_pfn1 (account/storage state equal — not pruned at the
+    floor; an old receipt cleanly unavailable-or-present, never wrong —
+    receipts DO prune under --full at min_blocks 64) -> no-corruption.
+    Leaves the node running and caught up; phase 10 scans its logs and checks
+    its height (but EXEMPTS it from the full anchor replay — --full drops old
+    receipts/logs, so a whole-history replay would legitimately miss them)."""
+    node_id = sf_lib.PRUNE_NODE_ID
+    LOG.info("[Phase prune] %s: born-SF from-0 sync + production prune shape "
+             "(--full --prune.transactionlookup.distance %d)...",
+             node_id, sf_lib.MINIMUM_UNWIND_SAFE_DISTANCE)
+    assert ctx.history is not None, "history must exist before the prune probe"
+    assert ctx.history.transfers, "history must have at least one transfer"
+
+    # 1. Born-SF, prune-configured (phase 1), sync the whole chain from 0.
+    #    With the production shape this must NOT crash (the sub-floor distance
+    #    that did is gone); a clean from-0 catch-up is itself the first signal.
+    await start_fresh_sf_node(ctx, node_id)
+    await sync_to_tip(ctx, node_id)
+
+    node = ctx.cluster.get_node(node_id)
+    sibling = ctx.cluster.get_node("sf_pfn1")  # archive SF twin (full history)
+
+    # 2. The crash tripwire: the pruner must not have taken the node down.
+    assert_no_pruner_crash(node, "Phase prune")
+
+    # 3. Offline: SF layout still holds; classify the changeset segments. At
+    #    the 10064 floor with tip << 10064, changeset pruning has not (and
+    #    must not) triggered — lowest-block 0 is CORRECT here, i.e.
+    #    NOT_YET_EXPECTED. The tip>floor reclamation leak (NOT_RECLAIMED) is
+    #    covered by unit tests + §12.1, unreachable at this tip.
+    tip = await asyncio.to_thread(
+        lambda: ctx.cluster.get_node("node1").w3.eth.block_number
+    )
+    await stop_node_and_wait_exit(node)
+    env = _offline_env(ctx, node)
+    ctx.layout_counts[f"Phase prune/{node_id}"] = lib.assert_sf_layout(
+        env, f"Phase prune/{node_id}"
+    )
+    layout = lib.inspect_changeset_static_files(env.datadir, env.static_files_dir)
+    for kind, lowest in (
+        ("account", layout.lowest_account_block),
+        ("storage", layout.lowest_storage_block),
+    ):
+        assert lowest is not None, (
+            f"[Phase prune] {node_id}: no {kind} changeset segment to classify"
+        )
+        effect = lib.classify_changeset_prune(
+            lowest,
+            tip_block=tip,
+            distance=sf_lib.MINIMUM_UNWIND_SAFE_DISTANCE,
+        )
+        assert effect is lib.ChangesetPruneEffect.NOT_YET_EXPECTED, (
+            f"[Phase prune] {node_id} {kind} changeset effect={effect.value} at "
+            f"tip={tip}, floor={sf_lib.MINIMUM_UNWIND_SAFE_DISTANCE}, lowest="
+            f"{lowest}: expected NOT_YET_EXPECTED (tip < floor). NOT_RECLAIMED "
+            f"would mean the merge-branch reclamation leak (design doc "
+            f"§11/§12.1) surfaced earlier than the floor; OVER_PRUNED means "
+            f"corruption."
+        )
+        LOG.info(
+            "[Phase prune] %s %s changeset prune effect: %s (lowest=%d, "
+            "tip=%d < floor %d — pruning correctly not triggered)",
+            node_id, kind, effect.value, lowest, tip,
+            sf_lib.MINIMUM_UNWIND_SAFE_DISTANCE,
+        )
+    await restart_node_and_catch_up(ctx.cluster, node)
+
+    # 4. Online no-corruption guardrail vs the archive sibling.
+    #    account/storage state is NOT pruned (floored at 10064 > tip), so
+    #    both a recent AND an early historical read must EQUAL the sibling —
+    #    a wrong value would be corruption. At scale (tip > floor) the
+    #    expectation REVERSES: below-horizon reads return StateAtBlockPruned
+    #    (proven online in §12.1) — hence the except-branch tolerates a clean
+    #    "state pruned" error; only a WRONG value ever fails here.
+    recipient = ctx.history.recipient
+    early_block = ctx.history.transfers[0].block_number  # v1.7.5-era
+    recent_block = max(tip - 5, early_block)
+
+    def _balance(n: Node, block: int) -> int:
+        return n.w3.eth.get_balance(recipient, block_identifier=block)
+
+    for label, block in (("recent", recent_block), ("early", early_block)):
+        arch_bal = await asyncio.to_thread(lambda: _balance(sibling, block))
+        try:
+            prune_bal = await asyncio.to_thread(lambda: _balance(node, block))
+        except Exception as exc:  # noqa: BLE001 — a clean "state pruned" error is OK
+            LOG.info(
+                "[Phase prune] %s %s state @%d cleanly unavailable (%s) — "
+                "acceptable if a real prune triggered.",
+                node_id, label, block, type(exc).__name__,
+            )
+            continue
+        assert prune_bal == arch_bal, (
+            f"[Phase prune] {node_id} {label} balance @{block} {prune_bal} != "
+            f"archive {arch_bal} — WRONG value (corruption)."
+        )
+    LOG.info("[Phase prune] %s account/storage state reads match the archive "
+             "sibling (changesets not pruned at the floor)", node_id)
+
+    # 5. Receipts DO prune under --full (min_blocks 64): an old receipt should
+    #    be cleanly unavailable on the prune node while present on the archive
+    #    sibling. Unavailable OR present are both clean — only a wrong receipt
+    #    or a non-not-found error fails.
+    from web3.exceptions import TransactionNotFound  # web3 v6/v7 both expose it
+
+    old_tx = ctx.history.transfers[0].tx_hash
+    try:
+        await asyncio.to_thread(
+            lambda: sibling.w3.eth.get_transaction_receipt(old_tx)
+        )
+    except TransactionNotFound as exc:
+        raise AssertionError(
+            f"[Phase prune] archive sibling lost old receipt {old_tx} (sanity)"
+        ) from exc
+    try:
+        await asyncio.to_thread(
+            lambda: node.w3.eth.get_transaction_receipt(old_tx)
+        )
+    except TransactionNotFound:
+        LOG.info(
+            "[Phase prune] %s old receipt %s cleanly unavailable "
+            "(getTransactionReceipt -> not found) — receipts pruned under "
+            "--full (min_blocks 64); no hard error.", node_id, old_tx,
+        )
+    else:
+        LOG.info(
+            "[Phase prune] %s old receipt %s still available — receipts not "
+            "pruned for it yet; clean.", node_id, old_tx,
+        )
+
+    LOG.info(
+        "[Phase prune] %s config-path smoke test passed: pruner did not crash, "
+        "changesets NOT_YET_EXPECTED, no corruption. Node running + caught up.",
+        node_id,
+    )
+
+
 async def phase_9_l3_necessity_probe(ctx: FreshSyncContext) -> None:
     """L3: stop sf_val1 -> the chain MUST freeze (3 equal-power
     validators, quorum = all votes) -> restart -> the chain resumes and
@@ -1206,6 +1424,13 @@ async def phase_10_wrapup(ctx: FreshSyncContext) -> None:
         f"({ctx.tx_sender.total_confirmed}/{ctx.tx_sender.total_sent})"
     )
     for node in ctx.cluster.nodes.values():
+        # The prune node runs --full, which prunes receipts (min_blocks 64),
+        # so a whole-history anchor replay would legitimately miss the early
+        # receipt/log anchors. Its correctness is covered by
+        # phase_prune_node_guardrail; here it still gets the log scan and the
+        # height-gap check below.
+        if node.id == sf_lib.PRUNE_NODE_ID:
+            continue
         await replay_all_batches(ctx, node, "final")
     scan_all_node_logs(ctx.cluster, stage="final")
     assert await check_height_gap_ok(ctx.cluster), "final height gap check failed"
@@ -1261,6 +1486,7 @@ async def test_storage_v2_fresh_sync(cluster: Cluster, output_dir: Path):
         await _run_phase(ctx, phase_6_anchor_replays)
         await _run_phase(ctx, phase_7_sf_val1_join)
         await _run_phase(ctx, phase_8_sf_vfn2_matrix_close)
+        await _run_phase(ctx, phase_prune_node_guardrail)
         await _run_phase(ctx, phase_9_l3_necessity_probe)
         await _run_phase(ctx, phase_10_wrapup)
     finally:

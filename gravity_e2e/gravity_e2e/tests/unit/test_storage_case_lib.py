@@ -385,3 +385,101 @@ def test_assert_upgraded_legacy_layout_rejects_empty_tables():
         lib.assert_upgraded_legacy_layout(
             ENV, "t", **_probes(SettingsState.MISSING, False, 0)
         )
+
+
+# --- classify_changeset_prune: the prune-node correctness rule as data ----
+
+
+def test_classify_changeset_prune_not_yet_expected_below_distance():
+    # tip <= distance: the retained window still reaches genesis, so a
+    # lowest block of 0 is correct and proves nothing either way.
+    assert (
+        lib.classify_changeset_prune(0, tip_block=100, distance=128)
+        is lib.ChangesetPruneEffect.NOT_YET_EXPECTED
+    )
+
+
+def test_classify_changeset_prune_not_reclaimed_stuck_at_genesis():
+    # tip well past distance but segments still start at 0 — the storage-v2
+    # static-file reclamation LEAK: per the §12.1 empirical run the logical
+    # prune advanced (read boundary at tip-distance) while the segments are
+    # never physically reclaimed. Supersedes the old "silent no-op" label.
+    assert (
+        lib.classify_changeset_prune(0, tip_block=1000, distance=128)
+        is lib.ChangesetPruneEffect.NOT_RECLAIMED
+    )
+
+
+def test_classify_changeset_prune_not_reclaimed_empirical_10064():
+    # The exact single-node empirical run (design doc §12.1): tip 535038,
+    # --full floor distance 10064, changeset segments still start at block 0
+    # (the _0_499999 jar is retained though entirely below horizon 524974).
+    # Online probe confirmed StateAtBlockPruned below tip-distance, so this
+    # is the reclamation leak, classified from disk as NOT_RECLAIMED.
+    assert (
+        lib.classify_changeset_prune(0, tip_block=535038, distance=10064)
+        is lib.ChangesetPruneEffect.NOT_RECLAIMED
+    )
+    # One block past the floor is enough to leave NOT_YET_EXPECTED behind.
+    assert (
+        lib.classify_changeset_prune(0, tip_block=10065, distance=10064)
+        is lib.ChangesetPruneEffect.NOT_RECLAIMED
+    )
+
+
+def test_classify_changeset_prune_pruned_at_boundary():
+    # lowest advanced to exactly tip - distance: working front-truncation.
+    assert (
+        lib.classify_changeset_prune(872, tip_block=1000, distance=128)
+        is lib.ChangesetPruneEffect.PRUNED
+    )
+
+
+def test_classify_changeset_prune_pruned_when_lagging_keeps_more():
+    # Pruner lag keeps MORE than required (lowest below the boundary) — safe.
+    assert (
+        lib.classify_changeset_prune(500, tip_block=1000, distance=128)
+        is lib.ChangesetPruneEffect.PRUNED
+    )
+
+
+def test_classify_changeset_prune_over_pruned_past_boundary():
+    # Blocks inside the retained window were deleted (lowest above boundary).
+    assert (
+        lib.classify_changeset_prune(900, tip_block=1000, distance=128)
+        is lib.ChangesetPruneEffect.OVER_PRUNED
+    )
+
+
+def test_classify_changeset_prune_tolerance_absorbs_boundary_jitter():
+    boundary = 1000 - 128  # 872
+    assert (
+        lib.classify_changeset_prune(boundary + 1, tip_block=1000, distance=128)
+        is lib.ChangesetPruneEffect.OVER_PRUNED
+    )
+    assert (
+        lib.classify_changeset_prune(
+            boundary + 1, tip_block=1000, distance=128, tolerance_blocks=4
+        )
+        is lib.ChangesetPruneEffect.PRUNED
+    )
+
+
+def test_classify_changeset_prune_over_pruned_before_distance():
+    # Segments truncated while tip <= distance: nothing should be gone yet.
+    assert (
+        lib.classify_changeset_prune(50, tip_block=100, distance=128)
+        is lib.ChangesetPruneEffect.OVER_PRUNED
+    )
+
+
+def test_classify_changeset_prune_not_yet_at_10064_floor():
+    # The prune-node harness case: --full pins account/storage history at the
+    # MINIMUM_UNWIND_SAFE_DISTANCE floor (10064) and the chain only reaches
+    # ~1800 blocks, so changeset pruning legitimately never triggers and
+    # lowest-block 0 is CORRECT here (tip < floor -> NOT_YET_EXPECTED), which
+    # is a different case from the tip>floor reclamation leak above.
+    assert (
+        lib.classify_changeset_prune(0, tip_block=1800, distance=10064)
+        is lib.ChangesetPruneEffect.NOT_YET_EXPECTED
+    )

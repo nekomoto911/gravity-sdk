@@ -1,6 +1,6 @@
 """
 Pure helpers shared by the storage-v2 cluster cases
-(storage_v2_baseline / storage_v2_upgrade).
+(storage_v2_baseline / storage_v2_upgrade / storage_v2_fresh_sync).
 
 Everything here is deterministic and unit-tested in
 gravity_e2e/tests/unit/test_storage_case_lib.py. The pytest cases keep
@@ -17,6 +17,11 @@ orchestration and assertions; this module keeps the derivable facts:
 - assert_history_is_anchorable: positive controls on freshly collected
   anchors — the history must have produced real, distinguishable facts,
   otherwise a later replay would "pass" on trivially empty anchors.
+- assert_sf_layout / assert_upgraded_legacy_layout: offline layout probes
+  shared by TC4 and TC9.
+- classify_changeset_prune / ChangesetPruneEffect: map a prune node's
+  on-disk changeset segment coverage onto a named effect (used by TC9's
+  sf_prune1 guardrail).
 
 History: extracted from storage_v2_baseline's case-local
 storage_baseline_lib.py when storage_v2_upgrade needed the same logic
@@ -27,6 +32,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Sequence, Union
 
@@ -301,6 +307,94 @@ def assert_upgraded_legacy_layout(
         counts[table] = count.count
         LOG.info("[%s] %s entries: %d", stage, table, count.count)
     return counts
+
+
+class ChangesetPruneEffect(Enum):
+    """What a prune node's on-disk changeset segment coverage reveals about
+    account/storage-history pruning under the storage-v2 layout.
+
+    Distance-based history pruning keeps the last ``distance`` blocks and
+    removes everything older, so on a FULLY working prune the segments'
+    lowest block advances to about ``tip - distance``. These outcomes map
+    the measured lowest block onto the correctness rule so the case asserts
+    on a named effect instead of re-deriving the arithmetic inline.
+
+    Disk-only caveat (2026-07-23 empirical, design doc §12.1): the on-disk
+    segment lowest block alone CANNOT tell logical pruning apart from
+    physical reclamation. The single-node empirical run proved that the
+    merge-v2.3.0 binary's LOGICAL prune works — the AccountHistory /
+    StorageHistory prune checkpoint advances to ``tip - distance`` and
+    historical reads below it correctly return ``StateAtBlockPruned`` — while
+    the static-file changeset segments are NEVER physically reclaimed (the
+    missing ``prune_static_files``, doc §11). So a lowest block stuck at 0
+    while ``tip > distance`` is the RECLAMATION LEAK, not a no-op; the
+    ``StateAtBlockPruned`` online probe (or a PruneCheckpoints read) is what
+    confirms the logical half. See :attr:`NOT_RECLAIMED`.
+    """
+
+    NOT_YET_EXPECTED = "not_yet_expected"
+    """``tip <= distance`` and segments still reach genesis: a lowest block
+    of 0 is correct here and proves nothing either way."""
+
+    PRUNED = "pruned"
+    """Lowest block advanced into ``(0, tip - distance + tolerance]`` — the
+    static-file changesets were front-truncated as configured (BOTH the
+    logical prune AND physical reclamation happened)."""
+
+    NOT_RECLAIMED = "not_reclaimed"
+    """``tip > distance`` yet segments still start at block 0 — the static
+    files were never physically reclaimed. Per the empirical run (doc §12.1)
+    the logical prune HAS advanced (read boundary at ``tip - distance``,
+    below-horizon reads return ``StateAtBlockPruned``), so this is the
+    storage-v2 static-file RECLAMATION LEAK (missing ``prune_static_files``,
+    merge-gap doc §11) — disk grows unbounded. NOTE: a hypothetical true
+    no-op (checkpoint never advanced either) has the SAME disk signature;
+    the online ``StateAtBlockPruned`` probe distinguishes them. Supersedes
+    the earlier ``NO_OP`` label, which wrongly implied nothing was pruned."""
+
+    OVER_PRUNED = "over_pruned"
+    """Lowest block advanced past ``tip - distance + tolerance`` (or advanced
+    at all while ``tip <= distance``) — blocks inside the retained window
+    were deleted, so history that should still be queryable is gone."""
+
+
+def classify_changeset_prune(
+    lowest_block: int,
+    tip_block: int,
+    distance: int,
+    *,
+    tolerance_blocks: int = 0,
+) -> ChangesetPruneEffect:
+    """Map a changeset segment's lowest block onto a :class:`ChangesetPruneEffect`.
+
+    ``lowest_block`` is the start block of the oldest changeset segment
+    (offline_db.ChangesetStaticFiles.lowest_account_block /
+    lowest_storage_block; the caller checks segments exist first — a prune
+    node that synced must have them). ``tip_block`` is the node's current
+    height, ``distance`` the configured
+    ``prune.{account,storage}history.distance``. ``tolerance_blocks`` absorbs
+    the pruner's batch/lag jitter around the ``tip - distance`` boundary
+    (the retained set is roughly ``[tip - distance, tip]``); keep it small so
+    genuine over-pruning still surfaces. Pure arithmetic on the disk fact —
+    the case owns the pass/fail policy (assert ``PRUNED`` to prove full
+    pruning works, or assert ``!= OVER_PRUNED`` to prove no corruption and
+    record ``NOT_RECLAIMED`` as the static-file reclamation leak, doc §11).
+    Disk coverage only: ``NOT_RECLAIMED`` is the leak per the §12.1 empirical
+    run — a true no-op shares the signature and needs the online
+    ``StateAtBlockPruned`` probe to tell apart (see the enum's caveat).
+    """
+    boundary = tip_block - distance
+    if lowest_block <= 0:
+        # Segments still reach genesis.
+        return (
+            ChangesetPruneEffect.NOT_YET_EXPECTED
+            if boundary <= 0
+            else ChangesetPruneEffect.NOT_RECLAIMED
+        )
+    # Segments have been front-truncated to some positive block.
+    if boundary <= 0 or lowest_block > boundary + tolerance_blocks:
+        return ChangesetPruneEffect.OVER_PRUNED
+    return ChangesetPruneEffect.PRUNED
 
 
 def derive_offline_env(

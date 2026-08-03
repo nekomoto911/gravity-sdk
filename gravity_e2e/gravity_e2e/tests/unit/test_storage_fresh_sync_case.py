@@ -48,7 +48,7 @@ render_config = _load_case_module(
 def test_node_sets_are_disjoint_and_complete():
     legacy, sf = set(sf_lib.LEGACY_NODE_IDS), set(sf_lib.SF_NODE_IDS)
     assert not legacy & sf
-    assert len(legacy) == 4 and len(sf) == 5
+    assert len(legacy) == 4 and len(sf) == 6
 
 
 def test_every_fullnode_has_a_pinned_upstream():
@@ -95,7 +95,10 @@ def test_first_batch_upstreams_exist_from_phase_1():
 
 
 def test_resolve_sf_mode_default_and_params():
-    assert sf_lib.resolve_sf_mode({}, {}) == "migrate"
+    # Code default when [sf].mode is omitted is migrate (compatibility);
+    # the recommended pin in test_params.toml.example is flag.
+    assert sf_lib.DEFAULT_SF_MODE == "migrate"
+    assert sf_lib.resolve_sf_mode({}, {}) == sf_lib.DEFAULT_SF_MODE
     assert sf_lib.resolve_sf_mode({"sf": {"mode": "migrate"}}, {}) == "migrate"
 
 
@@ -155,6 +158,50 @@ def test_deploy_start_scripts_emit_bare_flags_for_empty_values():
     how `--storage.v2` must reach clap (bare == true)."""
     deploy_sh = (CASES_DIR.parent.parent / "cluster" / "deploy.sh").read_text()
     assert 'reth_args_array+=( "--${key}" )' in deploy_sh
+
+
+def test_prune_node_is_an_sf_pfn_under_an_archive_sibling():
+    # The prune node is an SF node (new layout, flag-injected in phase 1)
+    # AND a fullnode; its upstream is an SF vfn so a same-upstream archive
+    # SF sibling (sf_pfn1) exists to compare reads against.
+    assert sf_lib.PRUNE_NODE_ID in sf_lib.SF_NODE_IDS
+    assert sf_lib.PRUNE_NODE_ID not in sf_lib.SF_FIRST_BATCH  # starts late
+    assert sf_lib.PINNED_UPSTREAMS[sf_lib.PRUNE_NODE_ID] == "sf_vfn1"
+    assert sf_lib.PINNED_UPSTREAMS["sf_pfn1"] == "sf_vfn1"  # the archive twin
+
+
+def test_inject_prune_reth_args_is_pure_and_coexists_with_flag():
+    # Start from a config that already carries the --storage.v2 opt-in: the
+    # prune profile must be added ALONGSIDE it, not replace it.
+    original = sf_lib.inject_sf_v2_flag_reth_args(
+        {"reth_args": {"datadir": "/x"}, "env_vars": {"BATCH_INSERT_TIME": 20}}
+    )
+    injected = sf_lib.inject_prune_reth_args(original)
+    ra = injected["reth_args"]
+    # The production shape: bare --full + tx-lookup distance at the floor.
+    assert ra["full"] == ""
+    assert ra["prune.transactionlookup.distance"] == sf_lib.MINIMUM_UNWIND_SAFE_DISTANCE
+    # coexists with the SF opt-in and preserves unrelated entries.
+    assert ra[sf_lib.SF_FLAG_RETH_ARG] == ""
+    assert ra["datadir"] == "/x"
+    assert injected["env_vars"] == {"BATCH_INSERT_TIME": 20}
+    # Pure: the input is untouched.
+    assert "full" not in original["reth_args"]
+    # reth_args absent/null — created.
+    assert sf_lib.inject_prune_reth_args({})["reth_args"]["full"] == ""
+
+
+def test_prune_args_carry_no_sub_min_history_distance():
+    # Regression lock for the live crash: an explicit accounthistory/
+    # storagehistory distance below MINIMUM_UNWIND_SAFE_DISTANCE (10064) hits
+    # `_ => PruneSegmentError::Configuration` in reth mode.rs and crashes the
+    # persistence service. --full must handle those two segments; the config
+    # must NOT pin them explicitly.
+    ra = sf_lib.inject_prune_reth_args({})["reth_args"]
+    assert "prune.accounthistory.distance" not in ra
+    assert "prune.storagehistory.distance" not in ra
+    # The floor is the real reth constant, not a scaled-down value.
+    assert sf_lib.MINIMUM_UNWIND_SAFE_DISTANCE == 10064
 
 
 def test_flag_matches_greth_clap_definition():
@@ -308,7 +355,7 @@ def test_role_specific_ports():
     # sf_val1 is sf_vfn2's upstream: the VFN listener must exist.
     assert "vfn_port" in nodes["sf_val1"]
     # Upstreams of pfns must expose a Public listener.
-    for pfn in ("pfn1", "sf_pfn1", "sf_pfn2"):
+    for pfn in ("pfn1", "sf_pfn1", "sf_pfn2", "sf_prune1"):
         upstream = sf_lib.PINNED_UPSTREAMS[pfn]
         assert "public_port" in nodes[upstream], (
             f"{pfn}'s upstream {upstream} lacks a public_port"

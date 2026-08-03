@@ -3,19 +3,20 @@
 # Rendered to cluster.toml by render_config.py using test_params.toml:
 # - {{SOURCE}}    -> the OLD (v1.7.5) binary for the four legacy nodes,
 #                    which the case rolling-upgrades to the new binary;
-# - {{SF_SOURCE}} -> the NEW (merge v2.3.0) binary for the five SF nodes,
+# - {{SF_SOURCE}} -> the NEW (merge v2.3.0) binary for the six SF nodes,
 #                    which never run anything else.
 # The rendered cluster.toml is untracked (see .gitignore). See README.md.
 #
-# Topology (storage-v2 TC9): the SF x non-SF upstream/downstream matrix.
+# Topology (storage-v2 TC9 + prune guardrail): SF x non-SF matrix.
 #
 #   node1 (genesis) <── vfn1 <── pfn1          <- tx entry (ALL load)
 #         ^                └───── sf_pfn2      SF pfn  <- legacy vfn
 #         │
-#   node2 (genesis) <── sf_vfn1 <── sf_pfn1    SF pfn  <- SF vfn
+#   node2 (genesis) <── sf_vfn1 <── sf_pfn1    SF pfn  <- SF vfn (archive)
+#         │                   └──── sf_prune1  SF pfn + --full (prune twin)
 #   sf_val1 (joins)  <── sf_vfn2                SF vfn  <- SF validator
 #
-# vfn1/pfn1 are the legacy controls (upgraded v1.7.5 datadirs); the five
+# vfn1/pfn1 are the legacy controls (upgraded v1.7.5 datadirs); the six
 # sf_* nodes are SF-enabled fresh nodes that sync from block 0 AFTER the
 # legacy core is upgraded. legacy-downstream-of-SF-upstream cells are
 # deliberately absent: the sync wire protocol is transparent to the
@@ -183,6 +184,26 @@ metrics_port = 9509
 inspection_port = 10518
 authrpc_port = 8959
 reth_p2p_port = 12538
+
+# sf_prune1: SF fullnode that ALSO runs reth's full-node prune profile
+# (--full + scaled prune.*.distance, injected into its reth_config in
+# phase 1). Same upstream as sf_pfn1 (sf_vfn1) so sf_pfn1 is its archive
+# twin — the prune node's reads are compared against it. role=pfn (a prune
+# node is a fullnode, never a validator: validators need full state).
+[[nodes]]
+id = "sf_prune1"
+host = "127.0.0.1"
+role = "pfn"
+source = {{SF_SOURCE}}
+seeds = [
+    { from = "sf_vfn1" },   # SF prune pfn <- SF vfn (start after sf_vfn1)
+]
+public_port = 6705
+rpc_port = 18954
+metrics_port = 9510
+inspection_port = 10519
+authrpc_port = 8960
+reth_p2p_port = 12539
 
 # [faucet_init] is REQUIRED here (unlike storage_v2_upgrade), and it
 # defines the case's fund-flow model (test-module constraint (4)):
