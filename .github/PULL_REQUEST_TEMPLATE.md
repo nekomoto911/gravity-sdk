@@ -1,5 +1,10 @@
 ## Description
-<!-- Please include a summary of the change, including which issue it fixes or what feature it adds. Include relevant motivation, context and documentation as appropriate. List dependencies that are required for this change, if any. -->
+<!--
+Squash-merge commit body = this section only (until the next ## heading).
+Keep it short: what changed and why. Reviewer-only notes go in the sections below.
+When merging via UI, paste this section into the squash commit message (or use
+`scripts/pr-squash-merge.sh <pr>`).
+-->
 
 Issue Number: closes #xxx
 
