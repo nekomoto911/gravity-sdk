@@ -30,7 +30,12 @@
     "terminalTotalDifficultyPassed": true,
     "extraFields": {},
     "depositContractAddress": null,
-    "gravityMinBaseFee": 50000000000
+    "gravityMinBaseFee": 50000000000,
+    "pragueTime": 1780909442,
+    "alphaTime": 1783328400,
+    "betaTime": 1785812400,
+    "osakaTime": 1785812400,
+    "gammaTime": 1787108400
   },
   "alloc": {
     "0x00000000000000000000000000000001625f0001": {
