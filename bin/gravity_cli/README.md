@@ -46,6 +46,14 @@ gravity_cli genesis generate-waypoint \
 
 Generate a new Ethereum-compatible account (private key, public key, address).
 
+Address derivation matches standard Ethereum / `cast wallet address`:
+`keccak256(uncompressed_secp256k1_pubkey_without_0x04)[12..]`.
+
+> **Historical bug (fixed):** older builds used `VerifyingKey::to_sec1_bytes()`
+> (compressed) and hashed `compressed[1..]`, so the YAML `address` did **not**
+> match the `private_key`. Do not reuse addresses emitted by those builds;
+> re-derive with `cast wallet address --private-key <key>` or regenerate.
+
 ```bash
 gravity_cli genesis generate-account \
   --output-file <path>         # Output YAML file path (required)

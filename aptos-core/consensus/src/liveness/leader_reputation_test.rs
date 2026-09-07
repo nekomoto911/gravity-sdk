@@ -811,12 +811,13 @@ fn test_extract_epoch_to_proposers_impl() {
     ) -> EpochState {
         EpochState {
             epoch,
-            verifier: todo!() //ValidatorVerifier::new(
+            // ValidatorVerifier::new(
             //     authors
             //         .iter()
             //         .map(|author| ValidatorConsensusInfo::new(*author, public_key.clone(), 1))
             //         .collect::<Vec<_>>(),
-            // ),
+            // )
+            verifier: todo!(),
         }
     }
 
