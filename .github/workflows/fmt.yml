@@ -17,8 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install nightly rustfmt
+      # Pin rustfmt so CI does not drift with floating `nightly`.
+      # Pair with rustfmt.toml `wrap_comments = false` so we do not need to
+      # churn unrelated long comments when rustfmt's wrap heuristics change.
+      - name: Install pinned nightly rustfmt
         run: |
-          rustup toolchain install nightly --component rustfmt
+          rustup toolchain install nightly-2026-09-05 --component rustfmt
       - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+        run: cargo +nightly-2026-09-05 fmt --all -- --check

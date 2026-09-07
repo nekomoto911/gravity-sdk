@@ -24,37 +24,38 @@ pub struct GenerateAccount {
     pub output_file: PathBuf,
 }
 
-fn generate_eth_account() -> Result<(String, String, String), anyhow::Error> {
-    // 1. Generate private key
-    // SigningKey::random(&mut OsRng) uses the OS random generator to create a new private key.
-    let signing_key = SigningKey::random(&mut OsRng);
-    let private_key_bytes = signing_key.to_bytes();
-    let private_key_hex = hex::encode(private_key_bytes);
+/// Derive `(private_key_hex, uncompressed_pubkey_hex, address)` for an EVM account.
+///
+/// Address formula (Ethereum):
+/// `keccak256(uncompressed_sec1_pubkey_without_0x04_prefix)[12..]`.
+///
+/// IMPORTANT: `VerifyingKey::to_sec1_bytes()` returns a *compressed* point in k256.
+/// Always use `to_encoded_point(false)` for address derivation.
+fn account_from_signing_key(
+    signing_key: &SigningKey,
+) -> Result<(String, String, String), anyhow::Error> {
+    let private_key_hex = hex::encode(signing_key.to_bytes());
 
-    // 2. Derive public key from private key
-    // verifying_key() derives the VerifyingKey (public key) from the SigningKey (private key).
     let verifying_key = signing_key.verifying_key();
-    // to_sec1_bytes() gets the uncompressed public key bytes.
-    // Note: Ethereum uses the uncompressed public key (64 bytes, without 0x04 prefix) for hashing.
-    let public_key_uncompressed_bytes = verifying_key.to_sec1_bytes();
+    let point = verifying_key.to_encoded_point(/* compress = */ false);
+    let bytes = point.as_bytes();
+    anyhow::ensure!(
+        bytes.len() == 65 && bytes[0] == 0x04,
+        "expected uncompressed SEC1 public key (0x04 || X || Y), got {} bytes prefix={:02x}",
+        bytes.len(),
+        bytes.first().copied().unwrap_or(0)
+    );
+    let public_key_for_hashing = &bytes[1..];
 
-    // Remove the first byte (0x04) from the uncompressed public key
-    // Ethereum address generation usually hashes the public key bytes without the 0x04 prefix.
-    let public_key_for_hashing = &public_key_uncompressed_bytes[1..]; // Remove 0x04 prefix
-
-    // 3. Derive account address from public key
-    // Hash the public key using Keccak-256
-    let mut hasher = Keccak256::new();
-    hasher.update(public_key_for_hashing);
-    let public_key_hash = hasher.finalize();
-
-    // Take the last 20 bytes of the hash as the address
-    // The address is usually the last 20 bytes (least significant bytes) of the hash, prefixed with
-    // 0x
-    let address_bytes = &public_key_hash[12..]; // Take 20 bytes from the 12th byte
-    let account_address = format!("0x{}", hex::encode(address_bytes));
+    let public_key_hash = Keccak256::digest(public_key_for_hashing);
+    let account_address = format!("0x{}", hex::encode(&public_key_hash[12..]));
 
     Ok((private_key_hex, hex::encode(public_key_for_hashing), account_address))
+}
+
+fn generate_eth_account() -> Result<(String, String, String), anyhow::Error> {
+    let signing_key = SigningKey::random(&mut OsRng);
+    account_from_signing_key(&signing_key)
 }
 
 impl Executable for GenerateAccount {
@@ -64,5 +65,54 @@ impl Executable for GenerateAccount {
         let yaml_string = serde_yaml::to_string(&account)?;
         fs::write(self.output_file, yaml_string)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Anvil/Hardhat default account #0.
+    const ANVIL0_PK: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const ANVIL0_ADDR: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
+    fn anvil0_signing_key() -> SigningKey {
+        SigningKey::from_slice(&hex::decode(ANVIL0_PK).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn anvil0_matches_standard_eth_address() {
+        let (pk_hex, pub_hex, addr) = account_from_signing_key(&anvil0_signing_key()).unwrap();
+        assert_eq!(pk_hex, ANVIL0_PK);
+        assert_eq!(pub_hex.len(), 128, "uncompressed pubkey without 0x04 is 64 bytes");
+        assert_eq!(addr.to_lowercase(), ANVIL0_ADDR);
+    }
+
+    #[test]
+    fn address_is_not_compressed_pubkey_hash() {
+        // Regression: old bug hashed compressed_sec1[1..] (32 bytes) instead of
+        // uncompressed[1..] (64 bytes). For Anvil #0 those diverge.
+        let sk = anvil0_signing_key();
+        let compressed = sk.verifying_key().to_encoded_point(true);
+        let cbytes = compressed.as_bytes();
+        assert!(cbytes[0] == 0x02 || cbytes[0] == 0x03);
+        let bogus = Keccak256::digest(&cbytes[1..]);
+        let bogus_addr = format!("0x{}", hex::encode(&bogus[12..]));
+
+        let (_, _, addr) = account_from_signing_key(&sk).unwrap();
+        assert_ne!(
+            addr.to_lowercase(),
+            bogus_addr.to_lowercase(),
+            "must not reproduce the compressed-pubkey address bug"
+        );
+        assert_eq!(addr.to_lowercase(), ANVIL0_ADDR);
+    }
+
+    #[test]
+    fn random_account_roundtrip_pubkey_len() {
+        let (pk, pub_hex, addr) = generate_eth_account().unwrap();
+        assert_eq!(pk.len(), 64);
+        assert_eq!(pub_hex.len(), 128);
+        assert!(addr.starts_with("0x") && addr.len() == 42);
     }
 }
