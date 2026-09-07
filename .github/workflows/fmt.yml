@@ -17,11 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pin rustfmt: floating `nightly` periodically changes comment wrapping and
-      # fails the whole tree on unrelated files. Last known-good that matched a
-      # green CI run (2026-09-05): rustc 1.100.0-nightly (0ed41eb41 2026-09-04),
-      # installed as the dated channel nightly-2026-09-05. The 2026-09-07
-      # floating nightly (5a2be9f5f 2026-09-06) broke long-comment layout.
+      # Pin rustfmt so CI does not drift with floating `nightly`.
+      # Pair with rustfmt.toml `wrap_comments = false` so we do not need to
+      # churn unrelated long comments when rustfmt's wrap heuristics change.
       - name: Install pinned nightly rustfmt
         run: |
           rustup toolchain install nightly-2026-09-05 --component rustfmt

@@ -169,8 +169,7 @@ fn create_network(
     let network_events = NetworkEvents::new(consensus_rx, None, true);
 
     let (self_sender, self_receiver) = gaptos::aptos_channels::new_unbounded_test();
-    // NetworkSender::new(author, consensus_network_client, self_sender, validators);
-    let network = todo!();
+    let network = todo!(); //NetworkSender::new(author, consensus_network_client, self_sender, validators);
 
     let twin_id = TwinId { id, author };
 
