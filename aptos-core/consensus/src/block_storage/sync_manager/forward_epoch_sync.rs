@@ -41,11 +41,9 @@ use gaptos::{
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::time;
-
-const FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC: u64 = 5_000;
 
 #[derive(Clone)]
 struct ForwardEpochSyncIndexEntry {
@@ -340,8 +338,18 @@ impl BlockStore {
         if let Some(index) = indexes.get(&epoch) {
             return Ok(index.clone());
         }
+        // Index build is synchronous and holds this mutex; cold builds can dominate Prepare latency.
+        let build_start = Instant::now();
         let index =
             Arc::new(Self::build_forward_epoch_sync_index(&self.storage.consensus_db(), epoch)?);
+        let build_elapsed_ms = build_start.elapsed().as_millis() as u64;
+        info!(
+            epoch = epoch,
+            entries = index.entries.len(),
+            boundaries = index.boundaries.len(),
+            build_elapsed_ms = build_elapsed_ms,
+            "Built forward epoch sync index"
+        );
         // A BlockStore only needs to serve the epoch it currently owns. Bounding this map avoids
         // retaining historical path metadata after unusual cross-epoch requests.
         indexes.clear();
@@ -486,6 +494,22 @@ impl BlockStore {
         request: IncomingForwardEpochSyncRequest,
         max_blocks_allowed: u64,
     ) -> anyhow::Result<()> {
+        let remote_peer = request.sender;
+        let (kind, epoch) = match &request.req {
+            ForwardEpochSyncRequest::V1(ForwardEpochSyncRequestV1::Prepare(prepare)) => {
+                ("Prepare", prepare.epoch)
+            }
+            ForwardEpochSyncRequest::V1(ForwardEpochSyncRequestV1::Fetch(fetch)) => {
+                ("Fetch", fetch.epoch)
+            }
+        };
+        info!(
+            remote_peer = remote_peer,
+            epoch = epoch,
+            kind = kind,
+            "Received forward epoch sync request"
+        );
+        let started = Instant::now();
         let response = match request.req {
             ForwardEpochSyncRequest::V1(ForwardEpochSyncRequestV1::Prepare(prepare)) => {
                 self.prepare_forward_epoch_sync(prepare)
@@ -494,6 +518,35 @@ impl BlockStore {
                 self.fetch_forward_epoch_sync(fetch, max_blocks_allowed)
             }
         };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let (result, detail) = match &response {
+            ForwardEpochSyncResponseV1::Prepared(manifest) => (
+                "Prepared",
+                format!(
+                    "manifest_id={} first_bn={} target_bn={}",
+                    manifest.manifest_id, manifest.first_block_number, manifest.target_block_number
+                ),
+            ),
+            ForwardEpochSyncResponseV1::Batch(batch) => (
+                "Batch",
+                format!(
+                    "records={} ledger_infos={} next_anchor_bn={}",
+                    batch.records.len(),
+                    batch.ledger_infos.len(),
+                    batch.next_anchor_block_number
+                ),
+            ),
+            ForwardEpochSyncResponseV1::Error(error) => ("Error", format!("{error:?}")),
+        };
+        info!(
+            remote_peer = remote_peer,
+            epoch = epoch,
+            kind = kind,
+            result = result,
+            detail = %detail,
+            elapsed_ms = elapsed_ms,
+            "Responded forward epoch sync request"
+        );
         let response = ConsensusMsg::ForwardEpochSyncResponse(Box::new(
             ForwardEpochSyncResponse::V1(response),
         ));
@@ -893,21 +946,34 @@ impl BlockRetriever {
         let request = ForwardEpochSyncRequest::V1(ForwardEpochSyncRequestV1::Prepare(
             ForwardEpochSyncPrepareRequest { epoch, anchor_block_number, anchor_block_id },
         ));
-        // Capability probing is deliberately short and bounded. During a rolling upgrade an old
-        // peer cannot decode the appended enum variant, so the caller must quickly fall back to
-        // the legacy reverse retrieval path.
+        // Capability probing is deliberately bounded so rolling-upgrade peers that cannot decode
+        // the appended enum variant fall back to legacy reverse retrieval quickly. Operators may
+        // raise the per-attempt timeout via FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC when the
+        // serving peer is under load (cold index build).
+        let prepare_timeout_msec = crate::forward_epoch_sync_prepare_timeout_msec();
+        info!(
+            epoch = epoch,
+            prepare_timeout_msec = prepare_timeout_msec,
+            max_attempts = 2,
+            "Trying forward epoch sync Prepare"
+        );
         let (response, serving_peer) = match self
             .request_forward_epoch_sync(
                 request,
                 self.available_peers.clone(),
-                Duration::from_millis(FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC),
+                Duration::from_millis(prepare_timeout_msec),
                 2,
             )
             .await
         {
             Ok(response) => response,
             Err(error) => {
-                info!(epoch = epoch, error = ?error, "Forward epoch sync unavailable; use legacy fallback");
+                info!(
+                    epoch = epoch,
+                    prepare_timeout_msec = prepare_timeout_msec,
+                    error = ?error,
+                    "Forward epoch sync unavailable; use legacy fallback"
+                );
                 return Ok(None);
             }
         };

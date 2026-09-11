@@ -80,6 +80,9 @@ pub use quorum_store::quorum_store_db::QUORUM_STORE_DB_NAME;
 pub use round_manager::round_manager_fuzzing;
 
 pub(crate) const ENABLE_FORWARD_EPOCH_SYNC_ENV: &str = "ENABLE_FORWARD_EPOCH_SYNC";
+pub(crate) const FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_ENV: &str =
+    "FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC";
+pub(crate) const FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_DEFAULT: u64 = 5_000;
 
 /// Opt-in switch for the block-number anchored epoch sync path. Nodes use the legacy reverse sync
 /// path unless operators explicitly set `ENABLE_FORWARD_EPOCH_SYNC=true`.
@@ -88,6 +91,37 @@ pub(crate) fn forward_epoch_sync_enabled() -> bool {
         .ok()
         .and_then(|value| value.parse::<bool>().ok())
         .unwrap_or(false)
+}
+
+/// Client-side timeout for a single forward-epoch-sync Prepare RPC attempt.
+///
+/// Operators can override via `FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC`. Unset, unparsable, or
+/// values `< 1` fall back to [`FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_DEFAULT`] (5000).
+pub(crate) fn forward_epoch_sync_prepare_timeout_msec() -> u64 {
+    match std::env::var(FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_ENV) {
+        Err(_) => FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_DEFAULT,
+        Ok(value) => match value.parse::<u64>() {
+            Ok(n) if n >= 1 => n,
+            Ok(n) => {
+                gaptos::aptos_logger::warn!(
+                    env = FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_ENV,
+                    value = n,
+                    default = FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_DEFAULT,
+                    "Invalid FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC (must be >= 1); using default"
+                );
+                FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_DEFAULT
+            }
+            Err(_) => {
+                gaptos::aptos_logger::warn!(
+                    env = FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_ENV,
+                    value = %value,
+                    default = FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_DEFAULT,
+                    "Unparsable FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC; using default"
+                );
+                FORWARD_EPOCH_SYNC_PREPARE_TIMEOUT_MSEC_DEFAULT
+            }
+        },
+    }
 }
 
 struct IntGaugeGuard {
